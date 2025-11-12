@@ -1,12 +1,15 @@
 import asyncio
 import os
-from datetime import datetime
+import re
+from datetime import datetime, date
+from typing import List, Dict
 
 import requests
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 URL_PAGE = "https://mano.affidea.lt/services/2/65/?cityId=138236&serviceId=140499&visitPaymentTypeId=2"
 
+# Telegram per ENV (GitHub Actions secrets)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "fallback")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "fallback")
 
@@ -29,64 +32,152 @@ def send_telegram_message(text: str):
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     params = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
     try:
-        requests.get(api_url, params=params, timeout=10)
+        requests.get(api_url, params=params, timeout=15)
     except Exception as e:
         print(f"[ERROR] Nepavyko išsiųsti Telegram žinutės: {e}")
 
 
-async def check_page_has_active_button() -> bool:
+def parse_date_from_nuo(nuo_line: str) -> date | None:
+    """
+    Priima eilutę kaip 'Nuo: 2025-11-13' arba 'Nuo: 13.11.2025' ir grąžina date.
+    """
+    s = nuo_line.strip()
+    # ISO YYYY-MM-DD
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        y, mo, d = map(int, m.groups())
+        return date(y, mo, d)
+    # DD.MM.YYYY
+    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", s)
+    if m:
+        d, mo, y = map(int, m.groups())
+        return date(y, mo, d)
+    return None
+
+
+async def extract_cards(page) -> List[Dict]:
+    """
+    Grąžina sąrašą kortelių:
+    {
+      'address': 'Vilniaus Antakalnio diagnostikos centras, ... Vilnius',
+      'price': 'Kaina: 320.00 €' arba '–',
+      'nuo': 'Nuo: 2025-11-13' arba '–',
+      'nuo_date': datetime.date | None,
+      'active': True/False
+    }
+    """
+    # imame visas “korteles”, kuriose yra Registruotis mygtukas
+    cards = await page.query_selector_all("div:has(button:has-text('Registruotis'))")
+    results: List[Dict] = []
+
+    for card in cards:
+        text = (await card.inner_text()).strip()
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+        address = next((l for l in lines if "Vilnius" in l), "–")
+        price = next((l for l in lines if l.startswith("Kaina")), "–")
+        nuo = next((l for l in lines if l.startswith("Nuo:")), "–")
+        nuo_dt = parse_date_from_nuo(nuo) if nuo != "–" else None
+
+        btn = await card.query_selector("button:has-text('Registruotis')")
+        disabled = await btn.is_disabled() if btn else True
+
+        results.append({
+            "address": address,
+            "price": price,
+            "nuo": nuo,
+            "nuo_date": nuo_dt,
+            "active": not disabled,
+        })
+
+    return results
+
+
+def signature_for_active(cards: List[Dict]) -> str:
+    """
+    Sudarom “parašą” iš AKTYVIŲ kortelių, kad žinotume ar kas pasikeitė:
+    address|YYYY-MM-DD, surūšiuota ir sujungta “||”.
+    """
+    parts = []
+    for c in cards:
+        if c["active"]:
+            d = c["nuo_date"].isoformat() if c["nuo_date"] else c["nuo"]
+            parts.append(f"{c['address']}|{d}")
+    if not parts:
+        return "inactive"
+    parts.sort()
+    return "active:" + "||".join(parts)
+
+
+async def check_and_collect():
     async with async_playwright() as p:
-        # DABAR: headless=False, kad matytum langą. Kai veiks – pakeisim į True.
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
-
         try:
-            # laukiam tik "load", ne "networkidle"
             await page.goto(URL_PAGE, wait_until="load", timeout=60000)
-        except PlaywrightTimeoutError:
-            print("[WARN] Page.goto timeout, bandau naudoti tai, kas spėjo užsikrauti")
+        except TimeoutError:
+            print("[WARN] Page.goto timeout – tęsiu su tuo, kas užsikrovė")
+        await page.wait_for_timeout(4000)
 
-        # duodam dar 3 s JS’ui susidėliot viską
-        await page.wait_for_timeout(3000)
-
-        # visi mygtukai su tekstu "Registruotis"
-        buttons = await page.query_selector_all('button:has-text("Registruotis")')
-        print(f"[DEBUG] Rasta 'Registruotis' mygtukų: {len(buttons)}")
-
-        has_active = False
-        for btn in buttons:
-            disabled = await btn.is_disabled()
-            print(f"[DEBUG] Mygtukas disabled={disabled}")
-            if not disabled:
-                has_active = True
-                break
-
+        cards = await extract_cards(page)
         await browser.close()
 
-    return has_active
+    has_active = any(c["active"] for c in cards)
+    return has_active, cards
 
 
 async def main():
     print(f"[INFO] Tikrinu {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ...")
 
-    has_active = await check_page_has_active_button()
-    prev_state = read_state()
-    current_state = "active" if has_active else "inactive"
+    has_active, cards = await check_and_collect()
 
-    print(f"[DEBUG] Ankstesnė būsena: {prev_state}, dabartinė: {current_state}")
+    # sudarom dabartinį “parašą”
+    sig_now = signature_for_active(cards)
+    prev = read_state()
 
-    if current_state != prev_state:
-        if current_state == "active":
-            send_telegram_message(
-                f"🟢 AFFIDEA: atsirado bent vienas aktyvus REGISTRUOTIS mygtukas!\n{URL_PAGE}"
+    # išvestis į konsolę
+    print(f"[DEBUG] prev_state={prev}")
+    print(f"[DEBUG] now_state={sig_now}")
+
+    # nusprendžiam ar siųsti
+    should_notify = (sig_now != prev)
+
+    if should_notify:
+        if sig_now.startswith("active:"):
+            # surandam artimiausią datą ir suformuojam gražią žinutę
+            active_cards = [c for c in cards if c["active"]]
+            # artimiausia:
+            earliest = min(
+                (c for c in active_cards if c["nuo_date"] is not None),
+                key=lambda x: x["nuo_date"],
+                default=None
             )
-        elif prev_state not in ("unknown", ""):
-            send_telegram_message(
-                "🔴 AFFIDEA: nebeliko aktyvių REGISTRUOTIS mygtukų (viskas vėl užimta)."
-            )
-        write_state(current_state)
 
-    print(f"[INFO] Būsena: {current_state}")
+            header = "🟢 AFFIDEA: atsirado laisvų vietų!"
+            if earliest:
+                header += f"\nArtimiausia data: {earliest['nuo_date'].isoformat()}"
+
+            # visų aktyvių išvardinimas
+            blocks = []
+            for c in active_cards:
+                blocks.append(
+                    f"{c['address']}\n"
+                    f"{c['price']}\n"
+                    f"{c['nuo']}"
+                )
+
+            msg = header + "\n\n" + "\n\n".join(blocks) + f"\n\n👉 {URL_PAGE}"
+            send_telegram_message(msg)
+
+        else:
+            # perėjimas į “inactive”
+            if prev not in ("unknown", ""):
+                send_telegram_message("🔴 AFFIDEA: nebeliko aktyvių REGISTRUOTIS mygtukų.")
+
+        write_state(sig_now)
+
+    # informacinė eilutė
+    print(f"[INFO] Būsena: {'active' if has_active else 'inactive'}")
 
 
 if __name__ == "__main__":
